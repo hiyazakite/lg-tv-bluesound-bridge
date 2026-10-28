@@ -1,0 +1,18 @@
+{
+  "bluos": {
+    "host": "192.168.1.100",
+    "port": 11000,
+    "timeoutMs": 2000
+  },
+  "mapping": {
+    "scale": 1.0,
+    "offset": -30,
+    "min": 0,
+    "max": 100
+  },
+  "debounceMs": 130,
+  "syncOnStart": true,
+  "reconcileMs": 5000,
+  "logLevel": "info",
+  "dryRun": false
+}

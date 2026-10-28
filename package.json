@@ -1,0 +1,14 @@
+{
+  "name": "tv-bluos-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bridge LG webOS TV volume/mute to a BluOS group over HTTP",
+  "main": "bridge.js",
+  "scripts": {
+    "test": "node --test test/bridge.test.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,43 @@
+#!/bin/sh
+# webOS Homebrew init.d hook: start the BluOS bridge.
+#
+# run-parts executes hooks sequentially and waits for them to finish, so this
+# script must daemonize and exit immediately.
+
+BASE=/var/lib/bluos-bridge
+LOG=$BASE/bridge.log
+PIDFILE=$BASE/bridge.pid
+
+# Stop a previous instance (boot or manual re-run).
+if [ -f "$PIDFILE" ]; then
+  pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) ;;
+    *) kill "$pid" 2>/dev/null || true ;;
+  esac
+fi
+for p in /proc/[0-9]*; do
+  [ -r "$p/cmdline" ] || continue
+  c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)
+  case "$c" in
+    *"$BASE/bridge.js"*) kill "${p#/proc/}" 2>/dev/null || true ;;
+  esac
+done
+
+# Keep the log bounded across reboots.
+if [ -f "$LOG" ]; then
+  size=$(wc -c <"$LOG" 2>/dev/null || echo 0)
+  if [ "$size" -gt 2097152 ]; then
+    mv "$LOG" "$LOG.1" 2>/dev/null || true
+  fi
+fi
+
+[ -r "$BASE/bridge.js" ] || exit 0
+[ -r "$BASE/config.json" ] || exit 0
+
+(
+  exec /usr/bin/node "$BASE/bridge.js" --config "$BASE/config.json"
+) </dev/null >>"$LOG" 2>&1 &
+
+echo $! >"$PIDFILE"
+exit 0
