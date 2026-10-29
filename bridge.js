@@ -32,7 +32,7 @@ const LUNA_TIMEOUT_MS = 3000;
 
 const DEFAULTS = {
   bluos: { port: 11000, timeoutMs: 2000 },
-  mapping: { scale: 1, offset: -30, min: 0, max: 100 },
+  mapping: { scale: 1, offset: 0, min: 0, max: 100 },
   debounceMs: 130,
   syncOnStart: true,
   reconcileMs: 5000,

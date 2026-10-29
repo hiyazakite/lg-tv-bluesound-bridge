@@ -6,7 +6,7 @@
   },
   "mapping": {
     "scale": 1.0,
-    "offset": -30,
+    "offset": 0,
     "min": 0,
     "max": 100
   },

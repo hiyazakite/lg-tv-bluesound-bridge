@@ -58,9 +58,13 @@ describe('mapLevel', () => {
   });
 
   it('falls back to the default mapping when none is given', () => {
-    assert.equal(mapLevel(49), 19);
-    assert.equal(mapLevel(49, undefined), 19);
-    assert.equal(mapLevel(49, null), 19);
+    // The point is the fallback, not the constant: omitting the mapping must
+    // behave exactly like passing the shipped default. The literal pins the
+    // documented default, which is 1:1 (TV 49 -> BluOS 49).
+    assert.equal(mapLevel(49), mapLevel(49, DEFAULTS.mapping));
+    assert.equal(mapLevel(49, undefined), mapLevel(49, DEFAULTS.mapping));
+    assert.equal(mapLevel(49, null), mapLevel(49, DEFAULTS.mapping));
+    assert.equal(mapLevel(49), 49);
   });
 
   it('accepts numeric strings (validated, then mapped)', () => {
@@ -140,9 +144,12 @@ describe('tvLevelFor', () => {
 
   it('accepts numeric strings and falls back to the default mapping', () => {
     assert.equal(tvLevelFor('19', MAPPING), 49);
-    assert.equal(tvLevelFor(19), 49);
-    assert.equal(tvLevelFor(19, undefined), 49);
-    assert.equal(tvLevelFor(19, null), 49);
+    // Same as above: the fallback must equal the shipped default mapping,
+    // which is 1:1, so BluOS 19 is TV 19.
+    assert.equal(tvLevelFor(19), tvLevelFor(19, DEFAULTS.mapping));
+    assert.equal(tvLevelFor(19, undefined), tvLevelFor(19, DEFAULTS.mapping));
+    assert.equal(tvLevelFor(19, null), tvLevelFor(19, DEFAULTS.mapping));
+    assert.equal(tvLevelFor(19), 19);
   });
 });
 
@@ -654,7 +661,7 @@ describe('loadConfig', () => {
     assert.equal(cfg.bluos.port, 11000);
     assert.equal(cfg.bluos.timeoutMs, 2000);
     assert.equal(cfg.mapping.scale, 1);
-    assert.equal(cfg.mapping.offset, -30);
+    assert.equal(cfg.mapping.offset, 0);
     assert.equal(cfg.mapping.min, 0);
     assert.equal(cfg.mapping.max, 100);
     assert.equal(cfg.debounceMs, 130);

@@ -35,9 +35,10 @@ luna .../master/setVolume            /Volume?level=N (group leader)
   display matches the soundbar. BluOS has no volume event stream; a tiny LAN
   poll is the efficient option.
 - **Only exact inverses move the TV.** `tvLevelFor()` returns a TV level only
-  when that level maps back to exactly the BluOS level. Unrepresentable levels
-  (default mapping: BluOS 71..100) and the fixed-volume `-1` sentinel are
-  skipped and warned once, so the two directions cannot fight.
+  when that level maps back to exactly the BluOS level, so the two directions
+  cannot fight. With the default 1:1 mapping every level is representable; a
+  custom `scale`/`offset` can make some levels unreachable, and the
+  fixed-volume `-1` sentinel always is — those are skipped and warned once.
 - **The remote still works.** A genuine TV volume or mute change is forwarded
   to the group leader, debounced (130 ms) and deduplicated.
 - **Echoes are ignored.** The TV subscription echoes the bridge's own write;
@@ -189,7 +190,7 @@ repository is only a template.
 | `bluos.port` | `11000` | BluOS control API port (port 80 is the web UI) |
 | `bluos.timeoutMs` | `2000` | HTTP request timeout |
 | `mapping.scale` | `1.0` | TV units per BluOS unit |
-| `mapping.offset` | `-30` | added after scaling |
+| `mapping.offset` | `0` | added after scaling |
 | `mapping.min` / `mapping.max` | `0` / `100` | clamp range |
 | `bluosToTv.enabled` | `true` | the TV follows the BluOS level (the TV is the slave) |
 | `bluosToTv.pollMs` | `1000` | BluOS `/Volume` poll interval (ms, min 250) |
@@ -218,13 +219,17 @@ repository is only a template.
 
 ### Mapping
 
-With the defaults: TV 0 -> BluOS 0, TV 49 -> BluOS 19, TV 100 -> BluOS 70.
-Raise `scale` if the top of the TV range should reach BluOS 100.
+The default is **1:1**, so the two displays always agree: TV 0 -> BluOS 0,
+TV 45 -> BluOS 45, TV 100 -> BluOS 100. The reverse direction is the same
+mapping inverted, so every BluOS level the app can show appears on the TV.
 
-The reverse direction uses the same mapping: BluOS 19 -> TV 49, BluOS 0 ->
-TV 30. Only exact inverses are used, so with the defaults every BluOS level
-0..70 is representable and 71..100 is not (TV 100 already maps to 70). Set
-`bluosToTv.enabled: false` for the old one-way TV -> BluOS behaviour.
+The formula is `bluos = clamp(round(tv * scale + offset), min, max)` and the
+TV follows its exact inverse. You can shift or compress the range, but an
+offset costs you the top of it: `offset: -30` makes TV 30..100 mean BluOS
+0..70, and BluOS 71..100 then has no TV level that maps back exactly, so the
+TV stops following up there and the bridge warns once per level. Keep
+`offset: 0` unless you have a reason to. Set `bluosToTv.enabled: false` for
+one-way TV -> BluOS behaviour.
 
 ### Editing and restarting
 
@@ -289,7 +294,7 @@ On the TV:
 ```sh
 tail -f /var/lib/bluos-bridge/bridge.log
 
-# move the TV volume; the log should show "tv 50 -> bluos 20"
+# move the TV volume; with the default 1:1 mapping the log shows "tv 50 -> bluos 50"
 luna-send -n 1 luna://com.webos.service.audio/master/setVolume '{"volume":50}' </dev/null
 
 # check the group
@@ -374,10 +379,13 @@ GitHub-hosted runner cannot reach it.
   then press the remote. If no lines appear, the TV is not reporting changes.
 - **The TV level does not follow BluOS.** Look for `reverse sync` lines in the
   log. `cannot map bluos level N to a TV level` means no TV level maps back
-  exactly (default mapping: BluOS 71..100); the TV must also be unmuted, since
-  webOS exposes no luna mute setter.
-- **Volume is too loud or too quiet.** Adjust `mapping.offset` (one step per
-  BluOS level) and restart the hook.
+  exactly, which only happens with a custom `mapping.scale`/`mapping.offset`
+  (the default 1:1 mapping represents every level); the TV must also be
+  unmuted, since webOS exposes no luna mute setter.
+- **Volume is too loud or too quiet at a given number.** With the default 1:1
+  mapping the TV and the app show the same number; the audible loudness is
+  whatever that BluOS level is. If the top of the TV remote is too loud, cap
+  it with `mapping.max` instead of shifting the scale.
 - **The log says `bluos reports fixed volume (-1)`.** The player has Fixed
   Volume enabled in the Bluesound app, so it ignores `/Volume?level=` requests
   and its level cannot be shown on the TV. Switch it to Variable Volume if the
@@ -406,7 +414,8 @@ Bluesound player keeps whatever volume it had.
   player. Mute from the Bluesound app when the soundbar should be silent.
 - Only exact inverse mappings are applied; a BluOS level the TV cannot
   represent leaves the TV where it is (it keeps following once the level is
-  representable again).
+  representable again). The default 1:1 mapping represents every level, so this
+  only applies if you set a custom `mapping.scale`/`mapping.offset`.
 - Only the group leader is addressed; slaves follow it with their own trims.
 - The service depends on `luna-send` and the webOS audio service; if either is
   unavailable it logs and retries but cannot do anything else.
