@@ -1,6 +1,6 @@
 {
   "name": "lg-tv-bluesound-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Keep an LG webOS TV's volume in step with a Bluesound (BluOS) player",
   "main": "bridge.js",
