@@ -33,6 +33,9 @@ slaves follow the master, keeping their own trims
   actually differs from the target.
 - Reads the device state at startup and reconciles every 5 s, so a dropped
   update or a short network failure heals itself.
+- While the TV is audible and playing, re-asserts the BluOS digital input so a
+  stopped or drifted player starts again (see
+  [Playback](#playback-spdif-input-keep-alive)).
 - Reconnects the luna subscription with exponential backoff (1 s .. 30 s).
 
 ## Group behaviour (verified on this hardware)
@@ -109,6 +112,17 @@ firmware and stay untouched.
 | `reconcileMs` | `5000` | retry interval for failed updates |
 | `logLevel` | `info` | `debug`, `info`, `warn`, `error` |
 | `dryRun` | `false` | log requests without sending them |
+| `playback.enabled` | `true` | enable the SPDIF input keep-alive (see below) |
+| `playback.inputType` | `"spdif"` | input type sent to `/Play?inputType=` |
+| `playback.index` | `0` | input index sent to `/Play?index=` |
+| `playback.playUrl` | `null` | escape hatch: when a non-empty string, select the source with `/Play?url=...` instead of the `inputType`/`index` form |
+| `playback.statusMs` | `10000` | how often the guard polls BluOS `/Status` (ms, min 1000) |
+| `playback.minReassertMs` | `10000` | minimum gap between two `/Play` re-asserts (ms, min 1000) |
+| `playback.enforceSource` | `true` | also re-assert when the device plays *another* source (e.g. Bluetooth/Spotify drifted in via the BluOS app) |
+| `playback.expectedService` | `"Capture"` | BluOS `service` of the digital input (`Capture` for external inputs) |
+| `playback.expectedName` | `null` | optional device input name, matched case-insensitively as an alternative to `expectedService` |
+| `playback.failOpen` | `true` | if `getForegroundAppInfo` is unavailable on the firmware, treat the TV as playing and rely on volume/mute only |
+| `playback.treatUnknownAsPlaying` | `true` | treat an empty/absent `playState` (tuner, HDMI, console sources) as playing; an explicit `paused`/`stopped`/`unloaded` still suppresses the re-assert |
 
 `config.json` in this repository is a template. The live copy on the TV is
 preserved on upgrade, so editing it there is the normal workflow.
@@ -121,6 +135,50 @@ After editing the config, restart:
 ```sh
 /var/lib/webosbrew/init.d/70-bluos-bridge
 ```
+
+## Playback (SPDIF input keep-alive)
+
+If someone "stops" playback on the BluOS device (or it drifts to Bluetooth,
+Spotify, ...), the bridge would keep mirroring volume to a silent player. The
+playback guard closes that gap:
+
+1. **Trigger:** the TV must be audible — unmuted **and** volume > 0 — **and**
+   report a playing signal. The playing signal comes from a second luna
+   subscription, `luna://com.webos.media/getForegroundAppInfo`: the TV counts
+   as playing when any `foregroundAppInfo` entry has `playState === "playing"`.
+   Tuner, HDMI and console sources report an **empty/absent** `playState`, so
+   while no entry says `paused`/`stopped`/`unloaded` such unknown states also
+   count as playing (`playback.treatUnknownAsPlaying`, default `true`; set it
+   to `false` to require an explicit `playing`). An explicit pause always
+   wins. If that API does not exist on the firmware (error or no answer), the
+   guard **fails open**: the volume/mute precondition alone is enough
+   (`playback.failOpen`). The bridge never re-asserts while the TV is muted or
+   at volume 0.
+2. **Check:** while the guard considers the TV playing, every
+   `playback.statusMs` it reads `GET /Status` and parses `<state>`, `<service>`
+   and `<name>`. `play` and `stream` both count as playing; for the digital
+   input `service` is `Capture`. If the device is stopped, or is playing
+   something else and `enforceSource` is on, the guard re-asserts. When the TV
+   is not considered playing, `/Status` is not polled at all.
+3. **Action:** `GET /Play?inputType=spdif&index=0` — this selects the input
+   *and* starts it (`/Play` alone cannot resume from `stop`). Sends are
+   rate-limited to one per `playback.minReassertMs`.
+
+Notes:
+
+- The bridge **only ever re-asserts play/input**. It never sends `/Stop` or
+  `/Pause`, and enforcement overrides a source you started in the BluOS app
+  while the TV is audible — that is the intended behaviour. Set
+  `playback.enabled: false` if you want the old volume-only behaviour.
+- Newer firmware that does not accept the `inputType` form can use the
+  `playback.playUrl` escape hatch: set it to the stream URL of your input and
+  the guard sends `/Play?url=<encoded>` instead.
+- `/Status` is polled on its own `playback.statusMs` interval, never on the
+  5 s volume reconcile. BluOS asks that `/Status` not be hammered without
+  long-polling; 10 s is a local-network compromise, so raise `statusMs` if the
+  extra request ever matters.
+- A dead BluOS device or a missing webOS API is logged and retried; it can
+  never crash the bridge.
 
 ## Test manually
 
@@ -139,6 +197,51 @@ curl -s http://<bluos-host>:11000/Volume
 
 `luna-send` needs stdin redirected (`</dev/null`), otherwise it exits without
 doing anything.
+
+## On-device end-to-end tests
+
+`test/device/` drives the real TV and the real BluOS device. It runs on the TV
+over SSH, because GitHub-hosted runners cannot reach a home LAN:
+
+```sh
+TV_HOST=<tv> npm run test:device              # read-only preflight + dryRun
+TV_HOST=<tv> npm run test:device:writes       # + volume, stop and drift tests
+TV_HOST=<tv> npm run test:device:installed    # + deploy and check the service
+```
+
+`TV_USER` (default `root`) and `TV_KEY` (optional) mirror `install.sh`. The
+BluOS address is discovered from the installed config; `BLUOS_HOST` and
+`BLUOS_PORT` override it.
+
+How it works: the suite is copied to `/tmp/tv-bluos-bridge-e2e` and started
+with `node --test`. The bridge under test talks to a recording reverse proxy on
+the TV instead of the device, so its requests are asserted verbatim while the
+device behaviour stays real. The test's own `/Stop` and input changes go
+straight to the device, so the proxy log contains bridge traffic only — which
+is what makes "the bridge never sent `/Stop` or `/Pause`" a meaningful check.
+
+| Test | Needs `--allow-writes` | Proves |
+| --- | --- | --- |
+| preflight | no | node, luna, TV volume, BluOS `/Status` and `/Volume` are usable |
+| dryRun | no | the bridge reads the device and sends no writes |
+| volume mirror | yes | a TV volume change becomes the mapped `/Volume?level=` |
+| stop re-assert | yes | `/Stop` is followed by `/Play?inputType=spdif&index=0` |
+| drift re-assert | yes | analog/Bluetooth is returned to SPDIF |
+| installed check | yes (`--allow-writes --installed`) | the deployed service recovers SPDIF |
+
+Safety rails: the script stops the installed bridge for the duration (two
+bridges would both mirror volume and mask a broken guard), snapshots the TV
+volume and the BluOS volume/mute first, restores them from a `trap` even on
+failure, and leaves the BluOS on the SPDIF input. It never launches apps or
+changes the TV input, and it removes `/tmp/tv-bluos-bridge-e2e` afterwards.
+`--installed` deploys with `install.sh`, which keeps the existing config.
+
+Two device limitations make individual tests skip rather than fail: webOS
+exposes no luna mute setter (the write tests skip while the TV is muted), and a
+BluOS in Fixed Volume mode ignores level writes (the volume test skips).
+
+For CI, run it on a self-hosted runner on the same LAN as the TV; a
+GitHub-hosted runner cannot reach it.
 
 ## Uninstall
 
@@ -162,6 +265,9 @@ BluOS group keeps whatever volume it had.
   then press the remote. If no lines appear, the TV is not reporting changes.
 - **Volume is too loud or too quiet.** Adjust `mapping.offset` (one step per
   BluOS level) and restart the hook.
+- **The log says `bluos reports fixed volume (-1)`.** The player has Fixed
+  Volume enabled in the BluOS app, so it ignores `/Volume?level=` requests.
+  Switch it to Variable Volume if the TV should control it.
 - **Mute behaves oddly.** Do not send a level while muted by hand: BluOS
   unmutes when a level is set. The bridge already orders unmute correctly.
 - **Boot timing.** webOS Homebrew runs `init.d` hooks about 35-40 s after

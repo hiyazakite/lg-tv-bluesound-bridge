@@ -2,3 +2,7 @@ node_modules/
 *.log
 *.pid
 .DS_Store
+
+# opengraph index + generated indexer artifact
+.opengraph/
+tsconfig.json

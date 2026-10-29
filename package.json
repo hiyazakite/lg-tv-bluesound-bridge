@@ -5,7 +5,12 @@
   "description": "Bridge LG webOS TV volume/mute to a BluOS group over HTTP",
   "main": "bridge.js",
   "scripts": {
-    "test": "node --test test/bridge.test.js"
+    "test": "node --test test/unit.test.js test/client.test.js test/integration.test.js",
+    "test:watch": "node --test --watch test/unit.test.js test/client.test.js test/integration.test.js",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=95 --test-coverage-branches=90 --test-coverage-functions=95 test/unit.test.js test/client.test.js test/integration.test.js",
+    "test:device": "sh test/device/run.sh",
+    "test:device:writes": "sh test/device/run.sh --allow-writes",
+    "test:device:installed": "sh test/device/run.sh --allow-writes --installed"
   },
   "license": "MIT",
   "engines": {

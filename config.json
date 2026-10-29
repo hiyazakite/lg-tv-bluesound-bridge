@@ -14,5 +14,18 @@
   "syncOnStart": true,
   "reconcileMs": 5000,
   "logLevel": "info",
-  "dryRun": false
+  "dryRun": false,
+  "playback": {
+    "enabled": true,
+    "inputType": "spdif",
+    "index": 0,
+    "playUrl": null,
+    "statusMs": 10000,
+    "minReassertMs": 10000,
+    "enforceSource": true,
+    "expectedService": "Capture",
+    "expectedName": null,
+    "failOpen": true,
+    "treatUnknownAsPlaying": true
+  }
 }
