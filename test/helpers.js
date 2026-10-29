@@ -1,6 +1,6 @@
 'use strict';
 
-// Shared fixtures and helpers for the tv-bluos-bridge test suite.
+// Shared fixtures and helpers for the lg-tv-bluesound-bridge test suite.
 //
 // This file is NOT a test file: it declares no tests, starts no processes and
 // registers no timers on import. The `npm test` script names the three

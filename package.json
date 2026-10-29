@@ -1,8 +1,8 @@
 {
-  "name": "tv-bluos-bridge",
+  "name": "lg-tv-bluesound-bridge",
   "version": "1.0.0",
   "private": true,
-  "description": "Bridge LG webOS TV volume/mute to a BluOS group over HTTP",
+  "description": "Keep an LG webOS TV's volume in step with a Bluesound (BluOS) player",
   "main": "bridge.js",
   "scripts": {
     "test": "node --test test/unit.test.js test/client.test.js test/integration.test.js",
@@ -12,6 +12,11 @@
     "test:device:writes": "sh test/device/run.sh --allow-writes",
     "test:device:installed": "sh test/device/run.sh --allow-writes --installed"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hiyazakite/lg-tv-bluesound-bridge.git"
+  },
+  "homepage": "https://github.com/hiyazakite/lg-tv-bluesound-bridge#readme",
   "license": "MIT",
   "engines": {
     "node": ">=18"

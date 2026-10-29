@@ -1,5 +1,8 @@
 #!/bin/sh
-# webOS Homebrew init.d hook: start the BluOS bridge.
+# webOS Homebrew init.d hook: start the LG TV <-> Bluesound bridge.
+#
+# The hook and its paths keep the historical "bluos-bridge" name so existing
+# installs upgrade in place.
 #
 # run-parts executes hooks sequentially and waits for them to finish, so this
 # script must daemonize and exit immediately.

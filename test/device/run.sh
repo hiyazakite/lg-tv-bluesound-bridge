@@ -61,7 +61,7 @@ fi
 TV_USER=${TV_USER:-root}
 TV_KEY=${TV_KEY:-}
 TV_APP_DIR=${TV_APP_DIR:-/var/lib/bluos-bridge}
-REMOTE_DIR=/tmp/tv-bluos-bridge-e2e
+REMOTE_DIR=/tmp/lg-tv-bluesound-bridge-e2e
 
 export TV_HOST TV_USER TV_KEY
 
