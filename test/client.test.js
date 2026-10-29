@@ -78,7 +78,8 @@ describe('createBluOSClient', () => {
       const { client, requests } = await withClient(t);
       const body = await client.setLevel(20);
       assert.deepEqual(requests, ['/Volume?level=20']);
-      assert.equal(body, volumeXml());
+      // The device answers with its new state, not the pre-write one.
+      assert.equal(body, volumeXml({ level: 20 }));
     });
 
     it('sends the level verbatim, including 0 and the top of the range', async (t) => {

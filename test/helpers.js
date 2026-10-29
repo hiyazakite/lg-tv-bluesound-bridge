@@ -111,6 +111,21 @@ async function startFakeBluOS(options) {
   const opts = options || {};
   const requests = [];
   const routes = opts.routes || [];
+  // The reverse sync reads /Volume repeatedly, so the body must be mutable:
+  // tests change it to simulate the BluOS app or the soundbar's own remote.
+  // A /Volume write updates the level/mute unless the test installed an
+  // explicit body override (a fixed-volume player ignores writes).
+  const volumeState = {
+    level: opts.volume && opts.volume.level !== undefined ? opts.volume.level : 19,
+    mute: opts.volume && opts.volume.mute ? 1 : 0,
+    body: opts.volumeBody === undefined ? null : opts.volumeBody,
+  };
+
+  function volumeBody() {
+    if (typeof volumeState.body === 'function') return volumeState.body();
+    if (volumeState.body !== null) return volumeState.body;
+    return volumeXml({ level: volumeState.level, mute: volumeState.mute });
+  }
 
   function replyFor(url) {
     for (const route of routes) {
@@ -131,7 +146,16 @@ async function startFakeBluOS(options) {
     }
     if (url.startsWith('/Status')) return { status: 200, body: opts.statusBody === undefined ? statusXml({ state: 'stop', service: 'Capture', name: 'Optical Input' }) : opts.statusBody, delayMs: 0 };
     if (url.startsWith('/Play')) return { status: 200, body: opts.playBody === undefined ? PLAY_XML : opts.playBody, delayMs: 0 };
-    return { status: 200, body: opts.volumeBody === undefined ? volumeXml() : opts.volumeBody, delayMs: 0 };
+    // A write the test did not override changes the device state, so the
+    // next /Volume read sees it: that is what makes the reverse-sync poll
+    // realistic. A GET has neither parameter and leaves the state alone.
+    if (volumeState.body === null && url.startsWith('/Volume')) {
+      const level = /[?&]level=(-?\d+(?:\.\d+)?)/.exec(url);
+      if (level) volumeState.level = Number(level[1]);
+      const mute = /[?&]mute=([01])/.exec(url);
+      if (mute) volumeState.mute = mute[1] === '1' ? 1 : 0;
+    }
+    return { status: 200, body: volumeBody(), delayMs: 0 };
   }
 
   const server = http.createServer((req, res) => {
@@ -161,7 +185,20 @@ async function startFakeBluOS(options) {
     await new Promise((resolve) => server.close(resolve));
   }
 
-  return { server, port, requests, close, urls: () => requests.slice() };
+  return {
+    server,
+    port,
+    requests,
+    close,
+    urls: () => requests.slice(),
+    setVolumeBody: (body) => { volumeState.body = body; },
+    setVolume: (volume) => {
+      const next = volume || {};
+      if (next.level !== undefined) volumeState.level = next.level;
+      if (next.mute !== undefined) volumeState.mute = next.mute ? 1 : 0;
+      volumeState.body = null;
+    },
+  };
 }
 
 // Reserve a port by opening and immediately closing a listener: nothing is
@@ -243,6 +280,42 @@ const FAKE_LUNA_SEND_SRC = `#!/usr/bin/env node
 const fs = require('node:fs');
 const spec = JSON.parse(process.env.FAKE_LUNA_SPEC || '{}');
 const argv = process.argv.slice(2).join(' ');
+// The reverse sync writes the TV volume with a one-shot setVolume call.
+// Record the payload and answer like the real service, then exit.
+if (argv.indexOf('setVolume') !== -1) {
+  const raw = process.argv[process.argv.length - 1];
+  let payload = null;
+  try { payload = JSON.parse(raw); } catch (e) { payload = raw; }
+  if (spec.setVolumeLog) {
+    try {
+      fs.appendFileSync(spec.setVolumeLog, JSON.stringify({ payload: payload, at: Date.now() }) + '\\n');
+    } catch (e) { /* ignore */ }
+  }
+  if (spec.setVolumeEchoFile) {
+    // setVolumeEchoLevel simulates a TV that does not land on the requested
+    // value; the default echoes exactly what was asked.
+    const echoed = spec.setVolumeEchoLevel === undefined ? payload && payload.volume : spec.setVolumeEchoLevel;
+    const echo = {
+      returnValue: true,
+      subscribed: true,
+      volumeStatus: { volume: echoed, muteStatus: false, maxVolume: 100 },
+    };
+    try {
+      fs.appendFileSync(spec.setVolumeEchoFile, JSON.stringify(echo) + '\\n');
+    } catch (e) { /* ignore */ }
+  }
+  if (spec.setVolumeNever) {
+    setInterval(function () {}, 1000);
+  } else {
+    const ok = spec.setVolumeOk === undefined ? true : !!spec.setVolumeOk;
+    const reply = ok
+      ? { returnValue: true, volume: payload && payload.volume }
+      : { returnValue: false, errorText: 'setVolume failed' };
+    if (spec.setVolumeStderr) fs.writeSync(2, String(spec.setVolumeStderr));
+    fs.writeSync(1, (spec.setVolumeRaw === undefined ? JSON.stringify(reply) : String(spec.setVolumeRaw)) + '\\n');
+    process.exit(spec.setVolumeExit === undefined ? 0 : spec.setVolumeExit);
+  }
+}
 const section = argv.indexOf('getForegroundAppInfo') !== -1
   ? spec.playState
   : argv.indexOf('getVolume') !== -1 ? spec.volume : null;
@@ -259,6 +332,16 @@ function pickPhase(s) {
 
 const s = section ? pickPhase(section) : {};
 const lines = (s.messages || []).map((m) => (typeof m === 'string' ? m : String(m && m.__raw !== undefined ? m.__raw : JSON.stringify(m))));
+
+function readFileLine() {
+  if (!s.file) return null;
+  try {
+    const all = fs.readFileSync(s.file, 'utf8').split('\\n').filter(Boolean);
+    return all.length ? all[all.length - 1] : null;
+  } catch (e) {
+    return null;
+  }
+}
 const intervalMs = s.intervalMs === undefined ? 40 : s.intervalMs;
 const startDelayMs = s.startDelayMs === undefined ? 0 : s.startDelayMs;
 const exitCode = s.exitCode === undefined ? 0 : s.exitCode;
@@ -270,13 +353,14 @@ function die() {
 }
 
 function emit() {
-  if (lines.length === 0) return;
-  if (!s.repeat && i >= lines.length) {
+  const fromFile = readFileLine();
+  if (!fromFile && lines.length === 0) return;
+  if (!fromFile && !s.repeat && i >= lines.length) {
     if (timer) { clearInterval(timer); timer = null; }
     return;
   }
-  const payload = s.repeat ? lines[i % lines.length] : lines[i];
-  i += 1;
+  const payload = fromFile || (s.repeat ? lines[i % lines.length] : lines[i]);
+  if (!fromFile) i += 1;
   process.stdout.write(payload + '\\n');
   if (s.exitAfterMessages !== undefined && i >= s.exitAfterMessages) die();
 }
@@ -284,7 +368,7 @@ function emit() {
 setTimeout(() => {
   for (const line of s.stderrLines || []) process.stderr.write(line + '\\n');
   emit();
-  if (intervalMs > 0 && (s.repeat || i < lines.length)) timer = setInterval(emit, intervalMs);
+  if (intervalMs > 0 && (s.repeat || s.file || i < lines.length)) timer = setInterval(emit, intervalMs);
   if (s.exitAfterMs !== undefined) setTimeout(die, s.exitAfterMs);
 }, startDelayMs);
 
@@ -321,6 +405,11 @@ function bridgeConfig(fake, opts) {
   if (options.playback !== null) {
     cfg.playback = Object.assign({ enabled: false }, options.playback || {});
   }
+  // The shipped default is on; tests opt in so the poll cannot perturb
+  // exact-request assertions made by the forward-sync tests.
+  if (options.bluosToTv !== null) {
+    cfg.bluosToTv = Object.assign({ enabled: false }, options.bluosToTv || {});
+  }
   return cfg;
 }
 
@@ -331,7 +420,7 @@ function bridgeConfig(fake, opts) {
 //          configFile, alive, waitFor, waitForRequest, waitForLog }.
 const START_BRIDGE_OPTIONS = [
   'prefix', 'serve', 'bluos', 'config', 'configFile', 'args', 'luna', 'env',
-  'port', 'mapping', 'debounceMs', 'syncOnStart', 'reconcileMs', 'logLevel', 'dryRun', 'playback', 'timeoutMs',
+  'port', 'mapping', 'debounceMs', 'syncOnStart', 'reconcileMs', 'logLevel', 'dryRun', 'playback', 'bluosToTv', 'timeoutMs',
 ];
 
 async function startBridge(t, options) {
@@ -347,8 +436,10 @@ async function startBridge(t, options) {
   const lunaBin = writeFakeLunaSend(dir);
   const args = opts.args === undefined ? ['--config', configFile] : opts.args;
 
+  const setVolumeLog = path.join(dir, 'set-volume.log');
+  const lunaSpec = Object.assign({}, opts.luna || {}, { setVolumeLog });
   const env = Object.assign({}, process.env, { LUNA_SEND_BIN: lunaBin });
-  if (opts.luna) env.FAKE_LUNA_SPEC = JSON.stringify(opts.luna).split('{dir}').join(dir);
+  env.FAKE_LUNA_SPEC = JSON.stringify(lunaSpec).split('{dir}').join(dir);
   if (opts.env) Object.assign(env, opts.env);
 
   const child = spawn(process.execPath, [BRIDGE_JS].concat(args), {
@@ -371,6 +462,14 @@ async function startBridge(t, options) {
   }
 
   const output = () => state.stdout + state.stderr;
+  const setVolumeCalls = () => {
+    try {
+      return fs.readFileSync(setVolumeLog, 'utf8').split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line));
+    } catch (error) {
+      return [];
+    }
+  };
   const context = () => 'requests: ' + JSON.stringify(fake ? fake.requests : []) +
     '\nexitCode: ' + String(child.exitCode) + ' signal: ' + String(child.signalCode) +
     '\nconfig: ' + JSON.stringify(config) +
@@ -401,6 +500,11 @@ async function startBridge(t, options) {
       const text = output();
       return typeof pattern === 'string' ? text.includes(pattern) : pattern.test(text);
     }, waitOptions),
+    setVolumeCalls,
+    waitForSetVolume: (level, waitOptions) => until(
+      () => setVolumeCalls().some((call) => call.payload && call.payload.volume === level),
+      waitOptions,
+    ),
   };
 }
 

@@ -14,6 +14,7 @@ const {
   DEFAULTS,
   parseTvLevel,
   mapLevel,
+  tvLevelFor,
   plan,
   parseVolume,
   parseStatus,
@@ -85,6 +86,63 @@ describe('mapLevel', () => {
     assert.equal(mapLevel(null, MAPPING), null);
     assert.equal(mapLevel(false, MAPPING), null);
     assert.equal(mapLevel(true, MAPPING), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tvLevelFor
+// ---------------------------------------------------------------------------
+
+describe('tvLevelFor', () => {
+  it('inverts the shipped mapping', () => {
+    assert.equal(tvLevelFor(19, MAPPING), 49);
+    assert.equal(tvLevelFor(0, MAPPING), 30);
+    assert.equal(tvLevelFor(70, MAPPING), 100);
+  });
+
+  it('round-trips every reachable level through mapLevel', () => {
+    for (let level = 0; level <= 70; level += 1) {
+      const tv = tvLevelFor(level, MAPPING);
+      assert.notEqual(tv, null, 'level ' + level + ' should be reachable');
+      assert.equal(mapLevel(tv, MAPPING), level, 'level ' + level + ' -> tv ' + tv);
+    }
+  });
+
+  it('returns null for levels the TV cannot represent', () => {
+    assert.equal(tvLevelFor(71, MAPPING), null);
+    assert.equal(tvLevelFor(100, MAPPING), null);
+    assert.equal(tvLevelFor(-1, MAPPING), null);
+    // With scale 2 the odd levels fall between two TV steps.
+    const doubled = { scale: 2, offset: 0, min: 0, max: 100 };
+    assert.equal(tvLevelFor(2, doubled), 1);
+    assert.equal(tvLevelFor(1, doubled), null);
+  });
+
+  it('treats levels below a raised minimum as unreachable', () => {
+    const raised = { scale: 1, offset: -30, min: 5, max: 100 };
+    assert.equal(tvLevelFor(5, raised), 35);
+    assert.equal(tvLevelFor(4, raised), null);
+  });
+
+  it('handles a negative scale', () => {
+    const inverted = { scale: -1, offset: 100, min: 0, max: 100 };
+    assert.equal(tvLevelFor(50, inverted), 50);
+    assert.equal(tvLevelFor(30, inverted), 70);
+    assert.equal(mapLevel(tvLevelFor(30, inverted), inverted), 30);
+  });
+
+  it('returns null for scale 0 and invalid levels', () => {
+    assert.equal(tvLevelFor(10, { scale: 0, offset: 0, min: 0, max: 100 }), null);
+    for (const bad of [NaN, Infinity, -Infinity, undefined, null, false, true, '', '   ', 'abc', {}, []]) {
+      assert.equal(tvLevelFor(bad, MAPPING), null, 'level: ' + String(bad));
+    }
+  });
+
+  it('accepts numeric strings and falls back to the default mapping', () => {
+    assert.equal(tvLevelFor('19', MAPPING), 49);
+    assert.equal(tvLevelFor(19), 49);
+    assert.equal(tvLevelFor(19, undefined), 49);
+    assert.equal(tvLevelFor(19, null), 49);
   });
 });
 
@@ -604,6 +662,7 @@ describe('loadConfig', () => {
     assert.equal(cfg.reconcileMs, 5000);
     assert.equal(cfg.logLevel, 'info');
     assert.equal(cfg.dryRun, false);
+    assert.deepEqual(cfg.bluosToTv, { enabled: true, pollMs: 1000, suppressMs: 1500 });
     assert.deepEqual(cfg.playback, {
       enabled: true,
       inputType: 'spdif',
@@ -796,6 +855,45 @@ describe('loadConfig', () => {
       assert.equal(cfg.playback.failOpen, true);
       assert.equal(cfg.playback.treatUnknownAsPlaying, true);
       assert.equal(load({ bluos: { host: HOST }, playback: { treatUnknownAsPlaying: false } }).playback.treatUnknownAsPlaying, false);
+    });
+  });
+
+  describe('bluosToTv section', () => {
+    it('merges a partial section over the defaults', () => {
+      const cfg = load({ bluos: { host: HOST }, bluosToTv: { enabled: false, pollMs: 500 } });
+      assert.equal(cfg.bluosToTv.enabled, false);
+      assert.equal(cfg.bluosToTv.pollMs, 500);
+      assert.equal(cfg.bluosToTv.suppressMs, 1500);
+    });
+
+    it('coerces the enabled flag', () => {
+      assert.equal(load({ bluos: { host: HOST }, bluosToTv: { enabled: 0 } }).bluosToTv.enabled, false);
+      assert.equal(load({ bluos: { host: HOST }, bluosToTv: { enabled: 1 } }).bluosToTv.enabled, true);
+      assert.equal(load({ bluos: { host: HOST }, bluosToTv: { enabled: '' } }).bluosToTv.enabled, false);
+    });
+
+    it('rejects a pollMs below 250 or non-finite', () => {
+      rejects({ bluos: { host: HOST }, bluosToTv: { pollMs: 249 } }, /bluosToTv\.pollMs must be >= 250/);
+      rejects({ bluos: { host: HOST }, bluosToTv: { pollMs: 0 } }, /bluosToTv\.pollMs must be >= 250/);
+      rejects({ bluos: { host: HOST }, bluosToTv: { pollMs: 'fast' } }, /bluosToTv\.pollMs must be >= 250/);
+      rejects({ bluos: { host: HOST }, bluosToTv: { pollMs: null } }, /bluosToTv\.pollMs must be >= 250/);
+      assert.equal(load({ bluos: { host: HOST }, bluosToTv: { pollMs: 250 } }).bluosToTv.pollMs, 250);
+    });
+
+    it('rejects a negative or non-finite suppressMs', () => {
+      rejects({ bluos: { host: HOST }, bluosToTv: { suppressMs: -1 } }, /bluosToTv\.suppressMs must be >= 0/);
+      rejects({ bluos: { host: HOST }, bluosToTv: { suppressMs: 'x' } }, /bluosToTv\.suppressMs must be >= 0/);
+      rejects({ bluos: { host: HOST }, bluosToTv: { suppressMs: null } }, /bluosToTv\.suppressMs must be >= 0/);
+      assert.equal(load({ bluos: { host: HOST }, bluosToTv: { suppressMs: 0 } }).bluosToTv.suppressMs, 0);
+    });
+
+    it('rejects a non-object section instead of spreading it', () => {
+      // A bare string/array would spread into a plain object and silently
+      // keep the defaults, so it is rejected before the merge.
+      rejects({ bluos: { host: HOST }, bluosToTv: 'off' }, /bluosToTv must be an object/);
+      rejects({ bluos: { host: HOST }, bluosToTv: false }, /bluosToTv must be an object/);
+      rejects({ bluos: { host: HOST }, bluosToTv: null }, /bluosToTv must be an object/);
+      rejects({ bluos: { host: HOST }, bluosToTv: [1] }, /bluosToTv must be an object/);
     });
   });
 

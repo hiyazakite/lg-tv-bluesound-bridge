@@ -24,7 +24,7 @@ const { spawn } = require('node:child_process');
 
 const { startProxy } = require('./proxy.js');
 const lib = require('./lib.js');
-const { mapLevel, parseStatus, parseVolume } = require('../../bridge.js');
+const { mapLevel, tvLevelFor, parseStatus, parseVolume } = require('../../bridge.js');
 
 const MAPPING = { scale: 1, offset: -30, min: 0, max: 100 };
 const HAVE_DEVICE = lib.BLUOS_HOST.length > 0;
@@ -40,6 +40,10 @@ function bridgeConfig(proxyPort, overrides) {
     reconcileMs: 5000,
     logLevel: 'debug',
     dryRun: false,
+    // The reverse poll is opt-in per test: the forward-sync and guard tests
+    // assert exact write lists, and a 1 s /Volume poll would add reads (and
+    // could move the TV) behind their backs.
+    bluosToTv: { enabled: false },
     playback: {
       enabled: true,
       inputType: 'spdif',
@@ -116,6 +120,15 @@ async function startTestBridge(t, overrides) {
     // Wait until the luna volume subscription has delivered its first message,
     // which is also when the startup sync happens.
     waitForVolumeSubscription: (timeoutMs) => lib.waitFor(() => /tv state: volume/.test(output), { timeoutMs: timeoutMs || 10000 }),
+    // The startup sync is scheduled at 0 ms after the first volume message.
+    // Wait for it to land before resetting the proxy, or its write shows up in
+    // the test's request list (the snapshot/restore of the previous test can
+    // leave the TV and BluOS levels mismatched, so a write is normal here).
+    waitForStartupSettled: async (timeoutMs) => {
+      const first = await lib.waitFor(() => /tv state: volume/.test(output), { timeoutMs: timeoutMs || 10000 });
+      if (first) await lib.sleep(300);
+      return first;
+    },
     stop: async () => {
       await stopChild(child);
       await proxy.close();
@@ -259,6 +272,48 @@ describeDevice('writes (opt-in)', () => {
     }
   });
 
+  it('follows a BluOS volume change on the TV without echoing it back', { skip: WRITE_SKIP }, async (t) => {
+    const tv0 = await lib.getTvState();
+    if (tv0.mute) return t.skip('TV is muted; webOS exposes no luna mute setter');
+    const bluos0 = await lib.bluosVolume();
+    if (bluos0.level === -1) return t.skip('BluOS reports fixed volume (-1); there is no inverse mapping');
+
+    // A BluOS level the TV can represent exactly and is not already showing.
+    const target = [5, -5, 10, -10, 1, -1, 2, -2]
+      .map((delta) => bluos0.level + delta)
+      .filter((level) => level >= 0 && level <= 70)
+      .map((level) => ({ bluos: level, tv: tvLevelFor(level, MAPPING) }))
+      .find((candidate) => candidate.tv !== null && candidate.tv !== tv0.level);
+    assert.ok(target, 'no representable BluOS target available from ' + bluos0.level);
+
+    const h = await startTestBridge(t, { bluosToTv: { enabled: true, pollMs: 250, suppressMs: 1500 } });
+    try {
+      assert.ok(await h.waitForStartupSettled(), 'no volume subscription; log:\n' + h.output());
+      h.proxy.reset();
+
+      // Straight to the device: the proxy log must contain bridge traffic only.
+      await lib.bluosSetLevel(target.bluos);
+
+      const followed = await lib.waitFor(async () => {
+        const tv = await lib.getTvState();
+        return tv.level === target.tv ? tv : false;
+      }, { timeoutMs: 8000 });
+      assert.ok(followed, 'the TV did not follow BluOS ' + target.bluos + ' -> ' + target.tv +
+        '; TV: ' + JSON.stringify(await lib.getTvState()) + '\nlog:\n' + h.output());
+
+      // The TV subscription echo of the bridge's own write must not be
+      // mirrored back: only reads may appear in the proxy log.
+      const writes = writeRequests(h);
+      assert.deepEqual(writes, [], 'the reverse sync echoed back to BluOS: ' + writes.join(', '));
+      assertNeverStopped(h);
+    } finally {
+      // Stop first, or the poll would move the TV back while restoring.
+      await h.stop();
+      await lib.bluosSetLevel(bluos0.level);
+      await lib.setTvVolume(tv0.level);
+    }
+  });
+
   it('re-asserts SPDIF after the BluOS device is stopped', { skip: WRITE_SKIP }, async (t) => {
     const tv = await lib.getTvState();
     if (tv.mute) return t.skip('TV is muted; webOS exposes no luna mute setter');
@@ -266,7 +321,7 @@ describeDevice('writes (opt-in)', () => {
 
     const h = await startTestBridge(t);
     try {
-      assert.ok(await h.waitForVolumeSubscription(), 'no volume subscription; log:\n' + h.output());
+      assert.ok(await h.waitForStartupSettled(), 'no volume subscription; log:\n' + h.output());
       h.proxy.reset();
 
       // Straight to the device: the proxy log must contain bridge traffic only.
@@ -299,7 +354,7 @@ describeDevice('writes (opt-in)', () => {
 
     const h = await startTestBridge(t);
     try {
-      assert.ok(await h.waitForVolumeSubscription(), 'no volume subscription; log:\n' + h.output());
+      assert.ok(await h.waitForStartupSettled(), 'no volume subscription; log:\n' + h.output());
       h.proxy.reset();
 
       // Analog reports service=Capture too; only inputTypeIndex tells it apart.

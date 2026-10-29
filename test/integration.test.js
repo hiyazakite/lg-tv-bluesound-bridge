@@ -6,6 +6,8 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   LUNA_VOLUME_URI,
@@ -242,6 +244,300 @@ describe('bridge.js (spawned)', () => {
       assert.equal(h.requests.filter((url) => url === '/Volume?level=20').length, 1, h.context());
       assert.equal(h.requests.filter((url) => url === '/Volume?level=30').length, 1, h.context());
       assert.ok(h.alive(), h.context());
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Reverse sync: BluOS is the authority, the TV display follows it
+  // -------------------------------------------------------------------------
+
+  // The TV's luna subscription echoes whatever the bridge writes. The fake
+  // luna appends that echo to `file`; the next subscription emit picks it up.
+  function tvEchoLuna(extra) {
+    return Object.assign({
+      volume: {
+        messages: [tvMessage(49, false)],
+        repeat: true,
+        intervalMs: 40,
+        file: '{dir}/tv-echo.jsonl',
+      },
+      setVolumeEchoFile: '{dir}/tv-echo.jsonl',
+    }, extra || {});
+  }
+
+  describe('reverse sync (bluosToTv)', () => {
+    it('adopts the BluOS level on the TV at startup and ignores the echo', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-startup-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: tvEchoLuna(),
+      });
+
+      assert.ok(await h.waitForSetVolume(51, { timeoutMs: 6000 }), h.context());
+      assert.ok(await h.waitForLog(/bluos 21 -> tv 51 \(reverse sync\)/, { timeoutMs: 6000 }), h.context());
+      await sleep(600);
+      assert.equal(
+        h.setVolumeCalls().filter((call) => call.payload.volume === 51).length, 1,
+        'the TV level is written once; ' + h.context(),
+      );
+      // The echo of 51 must not be mirrored back to BluOS (which would map it
+      // to 21 and could unmute or re-level the player).
+      assert.ok(
+        !h.requests.some((url) => url.startsWith('/Volume?')),
+        'the echo must not write to BluOS; ' + h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('follows a BluOS volume change from the poll without writing back', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-poll-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 19 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: tvEchoLuna(),
+      });
+
+      // Startup: TV 49 and BluOS 19 already agree, so nothing is written.
+      assert.ok(await h.waitForLog(/bluos state: level 19/, { timeoutMs: 6000 }), h.context());
+      await sleep(300);
+      assert.equal(h.setVolumeCalls().length, 0, h.context());
+
+      // The BluOS app raises the volume; the next poll must move the TV.
+      h.fake.setVolume({ level: 21 });
+      assert.ok(await h.waitForSetVolume(51, { timeoutMs: 6000 }), h.context());
+      assert.ok(await h.waitForLog(/bluos 21 -> tv 51 \(reverse sync\)/, { timeoutMs: 6000 }), h.context());
+
+      await sleep(400);
+      assert.ok(
+        !h.requests.some((url) => url.startsWith('/Volume?')),
+        'the echo must not write to BluOS; ' + h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('does not unmute a player muted from the BluOS app', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-muted-player-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21, mute: true } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        debounceMs: 50,
+        luna: tvEchoLuna({
+          volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 200, file: '{dir}/tv-echo.jsonl' },
+        }),
+      });
+
+      assert.ok(await h.waitForSetVolume(51, { timeoutMs: 6000 }), h.context());
+      await sleep(900);
+      // The TV cannot represent a muted player, so its unmuted echo must not
+      // become an unmute command (the forward reconcile runs between messages).
+      assert.ok(
+        !h.requests.some((url) => url.includes('mute')),
+        'the unmuted TV must not unmute BluOS; ' + h.context(),
+      );
+      assert.ok(
+        !h.requests.some((url) => url.startsWith('/Volume?level=')),
+        'the echo must not write a level; ' + h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('skips the TV write while the TV is muted and keeps the old fallback', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-muted-tv-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: { volume: { messages: [tvMessage(49, true)], repeat: true, intervalMs: 40 } },
+      });
+
+      // The TV cannot be muted by luna, so the reverse sync cannot represent
+      // a muted TV: the startup fallback keeps the original TV -> BluOS sync.
+      assert.ok(await h.waitForRequest('/Volume?mute=1', { timeoutMs: 6000 }), h.context());
+      await sleep(400);
+      assert.equal(h.setVolumeCalls().length, 0, 'a muted TV must not be written; ' + h.context());
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('does not touch the TV when the BluOS level is not representable', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-fixed-',
+        playback: { enabled: false },
+        bluos: { volumeBody: volumeXml({ level: -1 }) },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: { volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 40 } },
+      });
+
+      assert.ok(
+        await h.waitForLog(/cannot map bluos level -1 to a TV level; the TV will not follow/, { timeoutMs: 6000 }),
+        h.context(),
+      );
+      await sleep(300);
+      assert.equal(h.setVolumeCalls().length, 0, h.context());
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('warns and falls back when the TV write is refused', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-refused-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: {
+          setVolumeOk: false,
+          volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 40 },
+        },
+      });
+
+      assert.ok(
+        await h.waitForLog(/WARN reverse sync failed: setVolume failed/, { timeoutMs: 6000 }),
+        h.context(),
+      );
+      // The startup fallback still applies the original TV -> BluOS sync.
+      assert.ok(await h.waitForRequest('/Volume?level=19', { timeoutMs: 6000 }), h.context());
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('warns when luna-send returns malformed JSON', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-bad-json-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: {
+          setVolumeRaw: 'not json',
+          volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 40 },
+        },
+      });
+
+      assert.ok(
+        await h.waitForLog(/WARN reverse sync failed: invalid luna response: not json/, { timeoutMs: 6000 }),
+        h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('warns when luna-send exits non-zero', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-exit-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: {
+          setVolumeExit: 3,
+          setVolumeStderr: 'boom',
+          volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 40 },
+        },
+      });
+
+      assert.ok(
+        await h.waitForLog(/WARN reverse sync failed: luna-send exited 3: boom/, { timeoutMs: 6000 }),
+        h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('times out a hung luna write instead of stalling the poll', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-timeout-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: {
+          setVolumeNever: true,
+          volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 40 },
+        },
+      });
+
+      assert.ok(
+        await h.waitForLog(/WARN reverse sync failed: setVolume timed out after 3000ms/, { timeoutMs: 8000 }),
+        h.context(),
+      );
+      // The startup fallback still runs after the timeout.
+      assert.ok(await h.waitForRequest('/Volume?level=19', { timeoutMs: 6000 }), h.context());
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('reports a spawn failure when luna-send disappears mid-run', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-spawn-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        syncOnStart: false,
+        luna: { volume: { messages: [tvMessage(49, false)], repeat: true, intervalMs: 40 } },
+      });
+
+      assert.ok(await h.waitForLog(/syncOnStart disabled/, { timeoutMs: 6000 }), h.context());
+      fs.unlinkSync(path.join(h.dir, 'fake-luna-send'));
+      assert.ok(
+        await h.waitForLog(/WARN reverse sync failed: spawn .*ENOENT/, { timeoutMs: 6000 }),
+        h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('keeps retrying the volume subscription when luna-send is missing', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-no-luna-',
+        playback: { enabled: false },
+        env: { LUNA_SEND_BIN: '/nonexistent/luna-send' },
+      });
+
+      assert.ok(
+        await h.waitForLog(/luna-send \(volume\) failed to start .*ENOENT.*; reconnecting in 1000ms/, { timeoutMs: 6000 }),
+        h.context(),
+      );
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('treats a TV that lands on another level as a user change', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-mismatch-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 21 } },
+        bluosToTv: { enabled: true, pollMs: 250 },
+        luna: tvEchoLuna({ setVolumeEchoLevel: 50 }),
+      });
+
+      assert.ok(await h.waitForSetVolume(51, { timeoutMs: 6000 }), h.context());
+      // The TV reports 50 instead of the requested 51: that is not our echo,
+      // so the forward path applies it (50 maps to 20).
+      assert.ok(await h.waitForRequest('/Volume?level=20', { timeoutMs: 6000 }), h.context());
+      assert.ok(h.alive(), h.context());
+    });
+
+    it('lets a TV change through, then suppresses the poll for the window', async (t) => {
+      const h = await startBridge(t, {
+        prefix: 'bluos-reverse-window-',
+        playback: { enabled: false },
+        bluos: { volume: { level: 19 } },
+        bluosToTv: { enabled: true, pollMs: 250, suppressMs: 1500 },
+        luna: tvEchoLuna(),
+      });
+
+      // Startup: 49 <-> 19, nothing written.
+      assert.ok(await h.waitForLog(/bluos state: level 19/, { timeoutMs: 6000 }), h.context());
+      await sleep(300);
+
+      // The TV remote moves to 50: the forward sync is allowed and writes 20.
+      fs.appendFileSync(path.join(h.dir, 'tv-echo.jsonl'), JSON.stringify(tvMessage(50, false)) + '\n');
+      assert.ok(await h.waitForRequest('/Volume?level=20', { timeoutMs: 6000 }), h.context());
+
+      // A BluOS-app change inside the window must not drag the TV back...
+      h.fake.setVolume({ level: 21 });
+      await sleep(900);
+      assert.ok(
+        !h.setVolumeCalls().some((call) => call.payload.volume === 51),
+        'the reverse sync must be suppressed right after a TV change; ' + h.context(),
+      );
+
+      // ...but once the window closes, BluOS wins again.
+      assert.ok(await h.waitForSetVolume(51, { timeoutMs: 4000 }), h.context());
+      assert.ok(await h.waitForLog(/bluos 21 -> tv 51 \(reverse sync\)/, { timeoutMs: 4000 }), h.context());
     });
   });
 

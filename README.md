@@ -1,38 +1,54 @@
 # tv-bluos-bridge
 
-Keeps a BluOS group in step with the volume and mute state of an LG webOS TV.
+Keeps the volume in step between an LG webOS TV and a BluOS group. The soundbar
+is the authority; the TV display follows it, and the TV remote still works.
 
 The TV has no IR blaster, so its remote cannot be learned by the soundbar. Both
-devices are on the LAN, so this service runs on the TV and forwards every
-volume/mute change to the BluOS group leader over HTTP.
+devices are on the LAN, so this service runs on the TV: it polls the BluOS group
+leader and writes the TV level, and forwards TV remote changes back to the
+group.
 
 ```
-LG remote
-   |
-   v
-com.webos.service.audio/master/getVolume   (luna subscription)
-   |
-   v
-bridge.js  -- debounce, map TV 0..100 -> BluOS 0..100, dedupe
-   |
-   v
-http://<bluos-host>:11000/Volume?level=N   (group leader)
-   |
-   v
-slaves follow the master, keeping their own trims
+BluOS app / soundbar remote              LG remote
+          |                                 |
+          v                                 v
+  GET /Volume (1 s poll)        getVolume (luna subscription)
+          |                                 |
+          +---------------+-----------------+
+                          v
+   bridge.js -- inverse map BluOS 0..100 -> TV 0..100,
+                echo suppression, debounce, dedupe
+          |                                 |
+          v                                 v
+luna .../master/setVolume            /Volume?level=N (group leader)
+   (TV display follows)                        |
+                                               v
+                                 slaves follow the master, keeping trims
 ```
 
 ## What it does
 
-- Subscribes to `luna://com.webos.service.audio/master/getVolume` and reacts to
-  every change, including mute.
-- Maps the TV level with `clamp(round(tv * scale + offset), min, max)`. The
-  shipped default (`scale: 1`, `offset: -30`) maps TV 49 to BluOS 19.
-- Sends `GET /Volume?level=N` and `GET /Volume?mute=1|0` to the group leader.
+- Polls `GET /Volume` every second and writes the TV level with
+  `luna://com.webos.service.audio/master/setVolume`, so the TV display matches
+  what the soundbar is actually doing. BluOS has no volume event stream, so a
+  1 s poll of a tiny LAN response is the efficient option.
+- Inverse-maps the BluOS level with `tvLevelFor()`: the TV only moves when a TV
+  level maps back to exactly the BluOS level. Levels the TV cannot represent
+  (above the mapping's top, or the fixed-volume `-1` sentinel) are skipped and
+  logged once, so the two directions cannot fight each other.
+- Subscribes to `luna://com.webos.service.audio/master/getVolume`; a genuine TV
+  change (the remote) is still forwarded to the group leader, including mute.
+- Recognizes the TV subscription echo of its own write and never mirrors it
+  back. This matters most for a player muted in the BluOS app: the TV cannot
+  show mute, and its unmuted echo must not unmute the player.
 - Debounces rapid key presses (130 ms) and only sends when the device state
   actually differs from the target.
-- Reads the device state at startup and reconciles every 5 s, so a dropped
-  update or a short network failure heals itself.
+- BluOS wins at startup: the first TV message adopts the BluOS level. The old
+  TV -> BluOS sync runs as a fallback only when the TV cannot take it (muted,
+  unrepresentable level, or a failed write).
+- With `bluosToTv` on, the 5 s reconcile no longer pushes stale TV state to
+  BluOS; the forward path only acts after a genuine TV change. That keeps a
+  BluOS-app volume or mute change from being undone.
 - While the TV is audible and playing, re-asserts the BluOS digital input so a
   stopped or drifted player starts again (see
   [Playback](#playback-spdif-input-keep-alive)).
@@ -107,8 +123,11 @@ firmware and stay untouched.
 | `mapping.scale` | `1.0` | TV units per BluOS unit |
 | `mapping.offset` | `-30` | added after scaling |
 | `mapping.min` / `mapping.max` | `0` / `100` | clamp range |
+| `bluosToTv.enabled` | `true` | the TV follows the BluOS level (the TV is the slave) |
+| `bluosToTv.pollMs` | `1000` | BluOS `/Volume` poll interval (ms, min 250); BluOS has no volume events |
+| `bluosToTv.suppressMs` | `1500` | after a genuine TV change, how long the poll leaves the TV alone so the remote wins |
 | `debounceMs` | `130` | coalesce rapid changes |
-| `syncOnStart` | `true` | apply the TV level once at startup |
+| `syncOnStart` | `true` | at startup, adopt the BluOS level on the TV (falls back to the TV -> BluOS sync when the TV cannot take it) |
 | `reconcileMs` | `5000` | retry interval for failed updates |
 | `logLevel` | `info` | `debug`, `info`, `warn`, `error` |
 | `dryRun` | `false` | log requests without sending them |
@@ -129,6 +148,11 @@ preserved on upgrade, so editing it there is the normal workflow.
 
 Mapping examples with the defaults: TV 0 -> 0, TV 49 -> 19, TV 100 -> 70.
 Raise `scale` if the top of the TV range should reach BluOS 100.
+
+The reverse direction uses the same mapping: BluOS 19 -> TV 49, BluOS 0 -> TV 30.
+Only exact inverses are used, so with the defaults every BluOS level 0..70 is
+representable and 71..100 is not (TV 100 already maps to 70). Set
+`bluosToTv.enabled: false` for the old one-way TV -> BluOS behaviour.
 
 After editing the config, restart:
 
@@ -225,6 +249,7 @@ is what makes "the bridge never sent `/Stop` or `/Pause`" a meaningful check.
 | preflight | no | node, luna, TV volume, BluOS `/Status` and `/Volume` are usable |
 | dryRun | no | the bridge reads the device and sends no writes |
 | volume mirror | yes | a TV volume change becomes the mapped `/Volume?level=` |
+| reverse sync | yes | a BluOS volume change moves the TV and the echo is not mirrored back |
 | stop re-assert | yes | `/Stop` is followed by `/Play?inputType=spdif&index=0` |
 | drift re-assert | yes | analog/Bluetooth is returned to SPDIF |
 | installed check | yes (`--allow-writes --installed`) | the deployed service recovers SPDIF |
@@ -266,8 +291,13 @@ BluOS group keeps whatever volume it had.
 - **Volume is too loud or too quiet.** Adjust `mapping.offset` (one step per
   BluOS level) and restart the hook.
 - **The log says `bluos reports fixed volume (-1)`.** The player has Fixed
-  Volume enabled in the BluOS app, so it ignores `/Volume?level=` requests.
-  Switch it to Variable Volume if the TV should control it.
+  Volume enabled in the BluOS app, so it ignores `/Volume?level=` requests and
+  its level cannot be shown on the TV. Switch it to Variable Volume if the TV
+  should follow it.
+- **The TV level does not follow BluOS.** Look for `reverse sync` lines in the
+  log. `cannot map bluos level N to a TV level` means no TV level maps back
+  exactly (default mapping: BluOS 71..100); the TV must also be unmuted, since
+  webOS exposes no luna mute setter.
 - **Mute behaves oddly.** Do not send a level while muted by hand: BluOS
   unmutes when a level is set. The bridge already orders unmute correctly.
 - **Boot timing.** webOS Homebrew runs `init.d` hooks about 35-40 s after
@@ -276,8 +306,12 @@ BluOS group keeps whatever volume it had.
 
 ## Limitations
 
-- One-way sync. Changes made in the BluOS app are not reflected back to the TV,
-  and the next TV volume change will overwrite them.
+- The TV is the slave for level, not for mute. webOS has no luna mute setter, so
+  a BluOS mute is not shown on the TV and an unmuted TV never unmutes the
+  player. Mute from the BluOS app when the soundbar should be silent.
+- Only exact inverse mappings are applied; a BluOS level the TV cannot
+  represent leaves the TV where it is (it keeps following once the level is
+  representable again).
 - Only the group leader is addressed; slaves follow it with their own trims.
 - The service depends on `luna-send` and the webOS audio service; if either is
   unavailable it logs and retries but cannot do anything else.

@@ -10,6 +10,11 @@
     "min": 0,
     "max": 100
   },
+  "bluosToTv": {
+    "enabled": true,
+    "pollMs": 1000,
+    "suppressMs": 1500
+  },
   "debounceMs": 130,
   "syncOnStart": true,
   "reconcileMs": 5000,

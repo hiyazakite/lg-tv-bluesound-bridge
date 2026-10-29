@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 'use strict';
 
-// LG webOS TV volume/mute -> BluOS group volume/mute.
+// LG webOS TV volume/mute <-> BluOS group volume/mute.
+//
+// The TV is the slave for volume: bluosToTv polls the player and drives the TV
+// volume, so the TV display matches what the soundbar is actually doing. TV
+// volume changes still go the other way (the TV remote must keep working),
+// with echo suppression so the two paths cannot fight.
 //
 // While the TV is audible and playing, the bridge also re-asserts the digital
 // SPDIF input on the BluOS device, so a stopped or drifted player starts
@@ -21,7 +26,9 @@ const { spawn } = require('node:child_process');
 
 const LUNA_BIN_DEFAULT = '/usr/bin/luna-send';
 const LUNA_URI = 'luna://com.webos.service.audio/master/getVolume';
+const SET_VOLUME_URI = 'luna://com.webos.service.audio/master/setVolume';
 const PLAY_STATE_URI = 'luna://com.webos.media/getForegroundAppInfo';
+const LUNA_TIMEOUT_MS = 3000;
 
 const DEFAULTS = {
   bluos: { port: 11000, timeoutMs: 2000 },
@@ -31,6 +38,8 @@ const DEFAULTS = {
   reconcileMs: 5000,
   logLevel: 'info',
   dryRun: false,
+  // BluOS -> TV: the soundbar is the authority, the TV display follows it.
+  bluosToTv: { enabled: true, pollMs: 1000, suppressMs: 1500 },
   playback: {
     enabled: true,
     inputType: 'spdif',
@@ -73,6 +82,24 @@ function mapLevel(tvLevel, mapping) {
   const value = parseTvLevel(tvLevel);
   if (value === null) return null;
   return clamp(Math.round(value * m.scale + m.offset), m.min, m.max);
+}
+
+// Inverse of mapLevel: the TV level whose mapped value is `bluosLevel`.
+// Returns null when no TV level maps back to exactly that level (an
+// unreachable level, an out-of-range one, or scale 0). The exactness matters:
+// a TV level that maps back to a different BluOS level would make the two
+// sync directions fight each other forever.
+function tvLevelFor(bluosLevel, mapping) {
+  const m = mapping || DEFAULTS.mapping;
+  const value = parseTvLevel(bluosLevel);
+  if (value === null || !Number.isFinite(m.scale) || m.scale === 0) return null;
+  const candidate = clamp(Math.round((value - m.offset) / m.scale), 0, 100);
+  if (mapLevel(candidate, m) === value) return candidate;
+  for (const delta of [-1, 1, -2, 2]) {
+    const alternate = clamp(candidate + delta, 0, 100);
+    if (mapLevel(alternate, m) === value) return alternate;
+  }
+  return null;
 }
 
 // Decide what to send. `applied` is the last known device state (null when
@@ -209,11 +236,18 @@ function planPlayback(input) {
 
 function loadConfig(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  // Validate before the merge: spreading a string or an array into the
+  // defaults would silently produce an object and hide the typo.
+  if (raw.bluosToTv !== undefined &&
+      (raw.bluosToTv === null || typeof raw.bluosToTv !== 'object' || Array.isArray(raw.bluosToTv))) {
+    throw new Error('bluosToTv must be an object');
+  }
   const cfg = {
     ...DEFAULTS,
     ...raw,
     bluos: { ...DEFAULTS.bluos, ...(raw.bluos || {}) },
     mapping: { ...DEFAULTS.mapping, ...(raw.mapping || {}) },
+    bluosToTv: { ...DEFAULTS.bluosToTv, ...(raw.bluosToTv || {}) },
     playback: { ...DEFAULTS.playback, ...(raw.playback || {}) },
   };
   if (typeof cfg.bluos.host !== 'string' || cfg.bluos.host.length === 0) {
@@ -238,6 +272,13 @@ function loadConfig(file) {
   }
   if (!LOG_LEVELS[cfg.logLevel]) {
     throw new Error('logLevel must be one of ' + Object.keys(LOG_LEVELS).join(', '));
+  }
+  cfg.bluosToTv.enabled = !!cfg.bluosToTv.enabled;
+  if (!Number.isFinite(cfg.bluosToTv.pollMs) || cfg.bluosToTv.pollMs < 250) {
+    throw new Error('bluosToTv.pollMs must be >= 250');
+  }
+  if (!Number.isFinite(cfg.bluosToTv.suppressMs) || cfg.bluosToTv.suppressMs < 0) {
+    throw new Error('bluosToTv.suppressMs must be >= 0');
   }
   if (typeof cfg.playback.inputType !== 'string' || cfg.playback.inputType.length === 0) {
     throw new Error('playback.inputType must be a non-empty string');
@@ -321,6 +362,53 @@ function createBluOSClient(options) {
   };
 }
 
+// One-shot luna-send for the reverse sync. stdin is 'ignore' for the same
+// reason the subscriptions use it (luna-send does nothing on a tty), and a
+// hung call must not stall the poll.
+function setTvVolume(lunaBin, level) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(lunaBin, ['-n', '1', SET_VOLUME_URI, JSON.stringify({ volume: level })], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch (error) { /* already gone */ }
+      finish(new Error('setVolume timed out after ' + LUNA_TIMEOUT_MS + 'ms'));
+    }, LUNA_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => finish(error));
+    child.on('exit', (code) => {
+      const line = stdout.split('\n').filter(Boolean).pop() || '';
+      if (code !== 0) {
+        finish(new Error('luna-send exited ' + code + ': ' + (stderr || stdout).trim().slice(0, 120)));
+        return;
+      }
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        finish(new Error('invalid luna response: ' + line.slice(0, 120)));
+        return;
+      }
+      if (message.returnValue !== true) {
+        finish(new Error('setVolume failed: ' + line.slice(0, 120)));
+        return;
+      }
+      finish(null, message);
+    });
+  });
+}
+
 async function applyActions(actions, ctx) {
   const state = ctx.state;
   const mapping = ctx.cfg.mapping;
@@ -371,7 +459,19 @@ async function main() {
   const client = createBluOSClient(cfg.bluos);
   const lunaBin = process.env.LUNA_SEND_BIN || LUNA_BIN_DEFAULT;
 
-  const state = { cfg, tv: null, applied: null, synced: false };
+  const state = {
+    cfg,
+    tv: null,
+    applied: null,
+    synced: false,
+    // Last genuine (non-echo) TV volume message, used to keep the reverse
+    // sync from overriding a change the user just made with the TV remote.
+    tvChangedAt: 0,
+    // The TV level this bridge just wrote, so its subscription echo is not
+    // mistaken for a user change (and does not drive BluOS back).
+    expectingTvLevel: null,
+    expectingUntil: 0,
+  };
   // Playback-guard state: playStateAvailable null = not heard from yet,
   // true = getForegroundAppInfo works, false = unavailable (fail open).
   // tvPlayState is the tri-state derived from the subscription.
@@ -385,8 +485,12 @@ async function main() {
   let timer = null;
   let applying = false;
   let applyAgain = false;
+  let applyAgainForce = false;
   let stopping = false;
   let tvWasAudible = false;
+  let reverseBusy = false;
+  let reverseWarned = false;
+  let reverseErrorLogged = false;
   const subscriptions = [];
 
   log.info('starting; bluos ' + cfg.bluos.host + ':' + cfg.bluos.port +
@@ -404,14 +508,28 @@ async function main() {
     state.applied = null;
   }
 
-  async function applyNow() {
+  // `force` bypasses the authority check below. Only the startup fallback
+  // uses it: when the TV cannot take the BluOS level, the original TV ->
+  // BluOS sync is allowed to run even if the first TV message is already
+  // older than the suppression window by the time the read finishes.
+  async function applyNow(force) {
     if (!state.tv) return;
     if (applying) {
       applyAgain = true;
+      applyAgainForce = applyAgainForce || !!force;
       return;
     }
     applying = true;
     try {
+      // With bluosToTv on the player is authoritative. The TV drives it only
+      // after a genuine TV change (the remote, or the startup fallback): a
+      // stale TV reading must not undo a BluOS-app change, and an unmuted TV
+      // is not evidence that the player was unmuted (the TV cannot represent
+      // a muted player: there is no luna mute setter).
+      if (cfg.bluosToTv.enabled && !force &&
+          Date.now() - state.tvChangedAt >= cfg.bluosToTv.suppressMs) {
+        return;
+      }
       const desired = { level: mapLevel(state.tv.level, cfg.mapping), mute: state.tv.mute };
       const actions = plan(state.applied, desired);
       if (actions.length === 0) return;
@@ -422,21 +540,91 @@ async function main() {
       applying = false;
       if (applyAgain) {
         applyAgain = false;
-        await applyNow();
+        const nextForce = applyAgainForce;
+        applyAgainForce = false;
+        await applyNow(nextForce);
       }
     }
   }
 
-  function schedule(delay) {
+  function schedule(delay, force) {
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
-      applyNow();
+      applyNow(force);
     }, delay);
   }
 
   function tvIsAudible() {
     return !!state.tv && !state.tv.mute && state.tv.level > 0;
+  }
+
+  // True when this message is the subscription echo of a TV volume this
+  // bridge just wrote. A genuine change from the TV remote clears the
+  // expectation and is handled by the forward path instead.
+  function consumeTvEcho(level) {
+    if (state.expectingTvLevel === null) return false;
+    if (Date.now() > state.expectingUntil) {
+      state.expectingTvLevel = null;
+      return false;
+    }
+    if (level !== state.expectingTvLevel) {
+      state.expectingTvLevel = null;
+      return false;
+    }
+    state.expectingTvLevel = null;
+    return true;
+  }
+
+  // BluOS -> TV. Returns a short status so the startup path can decide
+  // whether to fall back to the forward sync.
+  async function syncReverse(force) {
+    if (!cfg.bluosToTv.enabled || stopping) return 'disabled';
+    if (reverseBusy || applying) return 'busy';
+    if (!state.tv) return 'no-tv';
+    if (!force && Date.now() - state.tvChangedAt < cfg.bluosToTv.suppressMs) return 'suppressed';
+    reverseBusy = true;
+    try {
+      const volume = await client.getVolume();
+      reverseErrorLogged = false;
+      // The device is the authority. Refreshing `applied` here also means the
+      // echo of the TV write below cannot be mistaken for a BluOS change.
+      state.applied = { level: volume.level, mute: volume.mute };
+      if (state.tv.mute) return 'muted-tv';
+      const target = tvLevelFor(volume.level, cfg.mapping);
+      if (target === null) {
+        if (!reverseWarned) {
+          reverseWarned = true;
+          log.warn('cannot map bluos level ' + volume.level + ' to a TV level; the TV will not follow');
+        }
+        return 'no-target';
+      }
+      if (target === state.tv.level) return 'same';
+      if (!cfg.dryRun) {
+        state.expectingTvLevel = target;
+        state.expectingUntil = Date.now() + LUNA_TIMEOUT_MS;
+        try {
+          await setTvVolume(lunaBin, target);
+        } catch (error) {
+          state.expectingTvLevel = null;
+          throw error;
+        }
+      }
+      log.info('bluos ' + volume.level + ' -> tv ' + target + ' (reverse sync)');
+      return 'applied';
+    } catch (error) {
+      if (!reverseErrorLogged) {
+        reverseErrorLogged = true;
+        log.warn('reverse sync failed: ' + error.message);
+      }
+      return 'failed';
+    } finally {
+      reverseBusy = false;
+    }
+  }
+
+  function syncReverseSafe(force) {
+    syncReverse(force).catch((error) => log.warn('reverse sync failed: ' + error.message));
   }
 
   // Re-assert the SPDIF input when the TV is audible and playing but the
@@ -569,20 +757,41 @@ async function main() {
       return false;
     }
     const mute = status.muteStatus === true || status.muteStatus === 'true';
+    const first = !state.synced;
+    const echo = consumeTvEcho(level);
+    const previous = state.tv;
+    const changed = !previous || previous.level !== level || previous.mute !== mute;
     state.tv = { level, mute };
-    log.debug('tv state: volume ' + level + ', mute ' + mute);
+    // Duplicate subscription messages are not a user change, and neither is
+    // the first message (a startup snapshot): with bluosToTv on, letting the
+    // snapshot open the forward-sync window would let an unmuted TV unmute a
+    // player that was muted from the BluOS app.
+    if (!echo && changed && !first) state.tvChangedAt = Date.now();
+    log.debug('tv state: volume ' + level + ', mute ' + mute + (echo ? ' (echo)' : ''));
     const audible = tvIsAudible();
     if (audible && !tvWasAudible) runGuardSafe(true);
     tvWasAudible = audible;
-    if (!state.synced) {
+    if (first) {
       state.synced = true;
       if (!cfg.syncOnStart) {
         log.info('syncOnStart disabled; waiting for the next change');
         return true;
       }
+      if (cfg.bluosToTv.enabled) {
+        // BluOS is the authority at startup: adopt its level on the TV, and
+        // fall back to the original TV -> BluOS sync only when the TV cannot
+        // take it (muted, unreachable level, or a write that failed).
+        syncReverse(true).then((result) => {
+          if (result === 'no-target' || result === 'muted-tv' || result === 'failed') schedule(0, true);
+        }).catch(() => schedule(0, true));
+        return true;
+      }
       schedule(0);
       return true;
     }
+    // Our own write's echo must not drive BluOS back (in particular it must
+    // not unmute a player that is muted while the TV is not).
+    if (echo) return true;
     schedule(cfg.debounceMs);
     return true;
   }
@@ -639,6 +848,12 @@ async function main() {
 
   setInterval(() => applyNow(), cfg.reconcileMs);
 
+  // BluOS has no volume event stream, so a 1 s /Volume poll is the efficient
+  // option: a tiny response on the LAN, and no /Status hammering.
+  if (cfg.bluosToTv.enabled) {
+    setInterval(() => syncReverseSafe(false), cfg.bluosToTv.pollMs);
+  }
+
   subscribe({ name: 'luna-send (volume)', uri: LUNA_URI, onMessage: onVolumeMessage });
   if (cfg.playback.enabled) {
     subscribe({
@@ -672,6 +887,7 @@ module.exports = {
   DEFAULTS,
   parseTvLevel,
   mapLevel,
+  tvLevelFor,
   plan,
   parseVolume,
   parseStatus,
